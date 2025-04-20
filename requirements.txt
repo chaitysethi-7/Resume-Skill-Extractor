@@ -1,5 +1,6 @@
-PyPDF2==3.0.1
-python-docx==0.8.11
-ttkthemes==3.2.2
-pillow==9.5.0
-sqlite3
+fastapi
+uvicorn
+pydantic
+python-multipart
+PyPDF2
+spacy
