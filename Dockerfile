@@ -1,27 +1,37 @@
-# Use official Python image
-FROM python:3.10-slim
+# --- Backend build (FastAPI) ---
+FROM python:3.10-slim as backend
+WORKDIR /app/backend
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m spacy download en_core_web_sm
+COPY backend .
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Install system dependencies for Tkinter and PDF parsing
-RUN apt-get update \
-    && apt-get install -y python3-tk tcl8.6 tk8.6 libglib2.0-0 libsm6 libxext6 libxrender-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set work directory
+# --- Frontend build (React) ---
+    FROM node:18-alpine as frontend
+    WORKDIR /app/frontend
+    COPY frontend/package*.json ./
+    RUN npm install --legacy-peer-deps
+    COPY frontend .
+    RUN NODE_OPTIONS=--openssl-legacy-provider npm run build
+# --- Final image ---
+FROM python:3.10-slim as final
 WORKDIR /app
 
-# Copy requirements
-COPY requirements.txt /app/
+# Copy backend
+COPY --from=backend /app/backend /app/backend
+# Copy frontend build
+COPY --from=frontend /app/frontend/build /app/frontend/build
 
-# Install Python dependencies
-RUN pip install --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# Install backend dependencies
+RUN pip install --no-cache-dir -r backend/requirements.txt
+# Download spaCy model in the final image
+RUN python -m spacy download en_core_web_sm
 
-# Copy project files
-COPY . /app/
+# Environment for FastAPI
+ENV PYTHONUNBUFFERED=1
 
-# Command to run the app (Tkinter GUI)
-CMD ["python", "resume_extractor.py"]
+# Expose FastAPI port
+EXPOSE 8000
+
+# Entrypoint: run backend (serving API and static frontend)
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

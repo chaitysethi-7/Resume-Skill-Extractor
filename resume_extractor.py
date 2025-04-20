@@ -5,9 +5,13 @@ import PyPDF2
 import json
 import sqlite3
 import os
-import re
 from datetime import datetime
 from PIL import Image, ImageTk
+import re
+
+# --- spaCy imports for advanced NLP extraction (works offline after model download) ---
+import spacy
+from spacy.matcher import PhraseMatcher
 
 class ResumeExtractor:
     # Common Indian and Western name patterns
@@ -91,21 +95,39 @@ class ResumeExtractor:
         'blockchain', 'ethereum', 'solidity', 'web3', 'unity', 'unreal engine'
     }
     
+    # List of common skills for matching
+    DEFAULT_SKILLS = [
+        "Python", "Java", "C++", "C#", "JavaScript", "SQL", "HTML", "CSS", "Machine Learning", "Deep Learning",
+        "Data Analysis", "Project Management", "Communication", "Leadership", "Teamwork", "Git", "Django", "Flask",
+        "React", "Angular", "Node.js", "Tableau", "Power BI", "Excel", "AWS", "Azure", "Docker", "Kubernetes"
+    ]
+
     def __init__(self):
         # Initialize main window
         self.root = ThemedTk(theme="arc")  # Modern theme
         self.root.title("Resume Skill Extractor")
-        self.root.geometry("1024x768")
-        # Configure window to be resizable
-        self.root.rowconfigure(0, weight=1)
-        self.root.columnconfigure(0, weight=1)
-        
+        self.root.geometry("800x600")
+
+        # --- Initialize spaCy NLP model (requires en_core_web_sm, see note below) ---
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            messagebox.showerror(
+                "spaCy Model Missing",
+                "spaCy English model not found. Please run: python -m spacy download en_core_web_sm\nThen restart the app."
+            )
+            raise
+        # Initialize PhraseMatcher for skills
+        self.matcher = PhraseMatcher(self.nlp.vocab, attr='LOWER')
+        patterns = [self.nlp(skill) for skill in self.DEFAULT_SKILLS]
+        self.matcher.add("SKILLS", patterns)
+
         # Initialize database
         self.init_db()
-        
+
         # Create GUI
         self.create_gui()
-        
+
     def init_db(self):
         """Initialize SQLite database and handle migrations"""
         self.conn = sqlite3.connect('resumes.db')
@@ -283,177 +305,103 @@ class ResumeExtractor:
         return text
     
     def extract_information(self, text):
-        """Extract relevant information from text"""
+        """
+        Extract relevant information from resume text using spaCy for advanced NLP.
+        - Name: First PERSON entity found
+        - Skills: PhraseMatcher on a predefined list
+        - Email/Phone: Heuristic
+        - Work Experience: NER + keyword heuristics (ORG, DATE, position keyword)
+        """
+        doc = self.nlp(text)
         lines = text.split('\n')
         info = {
             'name': '',
             'email': '',
             'phone': '',
-            'skills': set(),  # Using set to avoid duplicates
+            'skills': [],
             'work_experience': []
         }
-        
-        current_section = None
-        current_exp = None
-        skill_section_found = False
-        lines_processed = 0
-        section_headers = {
-            'skills': ['skills', 'skill set', 'technical skills', 'expertise', 'competencies'],
-            'experience': ['experience', 'employment', 'work history', 'professional experience'],
-            'education': ['education', 'academic', 'qualifications'],
-            'projects': ['projects', 'project experience'],
-            'achievements': ['achievements', 'awards', 'honors']
-        }
-        
-        # First pass: find phone number and email
-        for line in text.split():
-            phone_digits = ''.join(c for c in line if c.isdigit())
-            if len(phone_digits) >= 10:
-                info['phone'] = phone_digits[:10]
-                break
-        
-        section_found = None
-        skill_lines = []
-        non_skill_sections = set(['experience', 'education', 'projects', 'achievements'])
-        idx = 0
-        while idx < len(lines):
-            line_stripped = lines[idx].strip()
-            lower_line = line_stripped.lower()
-            if not line_stripped:
-                idx += 1
-                continue
-            # Section detection (fuzzy)
-            detected_section = None
-            for sec, keywords in section_headers.items():
-                if any(kw in lower_line for kw in keywords):
-                    detected_section = sec
+        # --- Skills Extraction ---
+        matches = self.matcher(doc)
+        found_skills = set()
+        for match_id, start, end in matches:
+            found_skills.add(doc[start:end].text)
+        info['skills'] = sorted(found_skills)
+
+        # --- Work Experience Extraction ---
+        experience_entries = []
+        for sent in doc.sents:
+            sent_text = sent.text.strip()
+            org = None
+            date = None
+            position = None
+            # Extract organization and date entities
+            for ent in sent.ents:
+                if ent.label_ == "ORG":
+                    org = ent.text
+                if ent.label_ == "DATE":
+                    date = ent.text
+            # Extract a position by keyword
+            for word in sent_text.split():
+                if word.lower() in self.POSITION_KEYWORDS:
+                    position = word
                     break
-            if detected_section:
-                current_section = detected_section
-                if detected_section == 'skills':
-                    skill_section_found = True
-                idx += 1
-                continue
-            # Name detection at the start
-            if not info.get('name') and lines_processed < 10:
-                for pattern in self.NAME_PATTERNS:
-                    name_match = re.search(pattern, line_stripped)
-                    if name_match:
-                        name = name_match.group(1) if name_match.groups() else name_match.group(0)
-                        name = re.sub(r'^(?:Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.)\s+', '', name)
-                        info['name'] = name.strip()
-                        break
-            lines_processed += 1
+            # If this sentence looks like work experience, add it
+            if org or date or position or any(word in sent_text.lower() for word in ['experience', 'work', 'employment', 'company', 'internship']):
+                experience_entries.append({
+                    'position': position if position else '',
+                    'organization': org if org else '',
+                    'duration': date if date else '',
+                    'dates': date if date else '',
+                    'raw': sent_text
+                })
+        # Remove duplicates based on 'raw' text
+        seen = set()
+        uniq_experience = []
+        for entry in experience_entries:
+            if entry['raw'] not in seen:
+                uniq_experience.append(entry)
+                seen.add(entry['raw'])
+        info['work_experience'] = uniq_experience
+
+        # --- Email and Phone Extraction ---
+        for line in lines:
             # Email detection
-            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            email_match = re.search(email_pattern, line_stripped)
-            if email_match and len(email_match.group()) < 100:
+            email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', line)
+            if email_match:
                 info['email'] = email_match.group()
-                idx += 1
-                continue
-            # Collect skill lines only from skills section
-            if current_section == 'skills':
-                # End of skills section if another section header is found
-                found_new_section = False
-                for sec, kws in section_headers.items():
-                    if sec != 'skills' and any(kw in lower_line for kw in kws):
-                        current_section = None
-                        found_new_section = True
-                        break
-                if found_new_section:
-                    idx += 1
-                    continue
-                skill_lines.append(line_stripped)
-            idx += 1
-        # Extract skills from skill_lines
-        extracted_skills = set()
-        for skill_line in skill_lines:
-            for skill in re.split('[,•\n\t|/]', skill_line):
-                skill = skill.strip()
-                skill = re.sub(r'^[-•●\*]\s*', '', skill)
-                if len(skill) < 2 or skill.isdigit() or re.match(r'\d{4}', skill):
-                    continue
-                if skill.lower() in ['and', 'or', 'in', 'with', 'using', 'etc', 'etc.', 'including']:
-                    continue
-                if skill.isupper() and len(skill) <= 5:
-                    extracted_skills.add(skill)
-                else:
-                    formatted_skill = ' '.join(word.capitalize() if not word.isupper() else word for word in skill.split())
-                    extracted_skills.add(formatted_skill)
-        # Improved: Extract skills only from skills section, robust delimiter/casing/acronym handling
-        if skill_section_found and skill_lines:
-            for skill_line in skill_lines:
-                # Split by common delimiters
-                for skill in re.split(r'[;,•\n\t|/]', skill_line):
-                    skill = skill.strip()
-                    # Remove leading/trailing punctuation or bullet
-                    skill = re.sub(r'^[-•●\*\d\.\)\(\s]+', '', skill)
-                    skill = re.sub(r'[-•●\*\d\.\)\(\s]+$', '', skill)
-                    # Filter out non-skills
-                    if not skill or len(skill) < 2:
-                        continue
-                    if skill.isdigit() or re.match(r'\d{4}', skill):
-                        continue
-                    if skill.lower() in ['and', 'or', 'in', 'with', 'using', 'etc', 'etc.', 'including', 'proficient', 'proficiency', 'knowledge', 'skills']:
-                        continue
-                    # Preserve acronyms and capitalize properly
-                    if skill.isupper() and len(skill) <= 6:
-                        extracted_skills.add(skill)
-                    else:
-                        formatted_skill = ' '.join(word if word.isupper() else word.capitalize() for word in skill.split())
-                        extracted_skills.add(formatted_skill)
-        else:
-            # Strict fallback: Only match exact skills from COMMON_SKILLS in short lines not in any section
-            for idx, line in enumerate(lines):
-                lower_line = line.lower().strip()
-                if any(any(kw in lower_line for kw in section_headers[sec]) for sec in non_skill_sections.union({'skills'})):
-                    continue
-                if len(lower_line.split()) > 8:
-                    continue
-                for skill in self.COMMON_SKILLS:
-                    # Match as whole word
-                    if re.search(r'\b' + re.escape(skill) + r'\b', lower_line):
-                        formatted = ' '.join(word.capitalize() if not word.isupper() else word for word in skill.split())
-                        extracted_skills.add(formatted)
-        info['skills'] = extracted_skills
+                break
+            # Phone detection
+            phone_match = re.search(r'\d{10}', line)
+            if phone_match:
+                info['phone'] = phone_match.group()
+                break
+        return info
 
-        # Work experience extraction (ensure section is detected and entries are added)
-        info['work_experience'] = []
-        in_experience = False
-        for idx, line in enumerate(lines):
-            lower_line = line.lower().strip()
-            # Detect start of experience section
-            if any(kw in lower_line for kw in section_headers['experience']):
-                in_experience = True
-                continue
-            # Detect start of a new section
-            if in_experience and any(any(kw in lower_line for kw in kws) for sec, kws in section_headers.items() if sec != 'experience'):
-                in_experience = False
-                continue
-            if in_experience:
-                # Look for date patterns
-                dates = []
-                for pattern in self.DATE_PATTERNS:
-                    matches = re.finditer(pattern, line)
-                    for match in matches:
-                        dates.append(match.group())
-                # If we found dates, this might be a new position
-                if dates and len(line) < 150:
-                    # Try to extract position and organization
-                    parts = re.split(r'\s*(?:at|@|-|,|\||with|for)\s*', line)
-                    position = parts[0].strip() if len(parts) > 0 else ''
-                    org = parts[1].strip() if len(parts) > 1 else ''
-                    exp_entry = {
-                        'position': position.title(),
-                        'organization': org,
-                        'dates': ', '.join(dates),
-                        'duration': ''
-                    }
-                    info['work_experience'].append(exp_entry)
+        # Detect start of a new section
+        if in_experience and any(any(kw in lower_line for kw in kws) for sec, kws in section_headers.items() if sec != 'experience'):
+            in_experience = False
+        if in_experience:
+            # Look for date patterns
+            dates = []
+            for pattern in self.DATE_PATTERNS:
+                matches = re.finditer(pattern, line)
+                for match in matches:
+                    dates.append(match.group())
+            # If we found dates, this might be a new position
+            if dates and len(line) < 150:
+                # Try to extract position and organization
+                parts = re.split(r'\s*(?:at|@|-|,|\||with|for)\s*', line)
+                position = parts[0].strip() if len(parts) > 0 else ''
+                org = parts[1].strip() if len(parts) > 1 else ''
+                exp_entry = {
+                    'position': position.title(),
+                    'organization': org,
+                    'dates': ', '.join(dates),
+                    'duration': ''
+                }
+                info['work_experience'].append(exp_entry)
         # If no work experience found, leave as empty list
-
-
-
         # Section detection
         if any(word in lower_line for word in ['skills', 'expertise', 'competencies', 'technical skills']):
             current_section = 'skills'
